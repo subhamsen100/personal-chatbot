@@ -1,0 +1,49 @@
+# 
+# Personal Knowledge Base AI – requirements.txt
+# Python 3.12 | Activate: source chatenv/bin/activate
+# 
+
+# Agent Orchestration
+google-adk>=1.0.0
+
+# Ollama Python Client ─
+ollama>=0.4.0
+
+# Vector Databases (use one or both)
+faiss-cpu>=1.8.0          # fast, in-process, recommended for offline
+chromadb>=0.6.0           # persistent, metadata filtering, good for dev
+
+# Document Ingestion──
+pypdf>=5.0.0              # PDF text extraction
+pymupdf>=1.25.0           # richer PDF/image extraction (also exposes fitz)
+python-docx>=1.1.0        # .docx support
+markdown>=3.7             # markdown parsing
+
+# Image Support (for VLM / qwen3-vl)
+Pillow>=11.0.0            # image loading & preprocessing
+
+# Text Chunking──
+langchain-text-splitters>=0.3.0   # lightweight, no full langchain required
+
+# API Backend ─
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.18  # file upload support
+
+# Streamlit UI 
+streamlit>=1.41.0
+
+# Persistent Memory / SQLite ORM ─
+sqlalchemy>=2.0.36
+aiosqlite>=0.20.0         # async SQLite for FastAPI
+
+# Data Validation & Settings ─
+pydantic>=2.10.0
+pydantic-settings>=2.7.0  # .env-based config
+
+# Utilities─
+python-dotenv>=1.0.1      # .env loading
+numpy>=2.2.0              # vector math
+httpx>=0.28.0             # async HTTP (used by ADK internals)
+tiktoken>=0.8.0           # token counting for context window management
+rich>=13.9.0              # pretty CLI output / logging
