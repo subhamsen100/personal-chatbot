@@ -6,15 +6,16 @@ Run:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import json
 import logging
 import shutil
-import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent.rag_agent import rag_agent
@@ -108,13 +109,26 @@ async def delete_session(session_id: str):
     return {"deleted": session_id}
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """Send a message and receive a grounded response."""
+    """
+    Stream NDJSON events for each processing stage, then the final answer.
+
+    Each line is a JSON object terminated by \\n.  Event types:
+      stage      — routing started
+      tool_start — a tool was invoked by the model
+      tool_done  — tool returned; includes per-tool elapsed ms
+      answer     — final text + total elapsed ms
+      error      — unhandled exception with traceback
+    """
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
-    result = await rag_agent.chat(req.session_id, req.message)
-    return result
+
+    async def event_stream():
+        async for event in rag_agent.chat_stream(req.session_id, req.message):
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @app.post("/api/ingest/file")

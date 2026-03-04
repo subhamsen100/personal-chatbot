@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -75,41 +77,111 @@ class RAGAgent:
             auto_create_session=True,
         )
 
-    # public API 
+    # public API
 
-    async def chat(self, session_id: str, user_message: str) -> dict:
+    async def chat_stream(self, session_id: str, user_message: str):
         """
-        Send a message and get a grounded response.
+        Async generator — yields stage/timing events then the final answer.
 
-        Returns:
-            {"answer": str, "session_id": str}
+        Event shapes
+        ------------
+        {"type": "stage",      "message": str}
+        {"type": "tool_start", "tool": str, "args": dict,  "elapsed_ms": int}
+        {"type": "tool_done",  "tool": str, "tool_ms": int, "elapsed_ms": int}
+        {"type": "answer",     "answer": str, "session_id": str,
+                               "total_ms": int, "tools_called": list[dict]}
+        {"type": "error",      "message": str, "trace": str, "total_ms": int}
         """
         memory_store.add_message(session_id, "user", user_message)
-
         new_message = types.Content(
             role="user",
             parts=[types.Part(text=user_message)],
         )
 
+        t0 = time.perf_counter()
+        ms = lambda: int((time.perf_counter() - t0) * 1000)
+
+        yield {"type": "stage", "message": "Routing query..."}
+        log.info("[query_start] session=%s message=%r", session_id, user_message[:80])
+
         final_text = ""
-        async for event in self._runner.run_async(
-            user_id=_USER_ID,
-            session_id=session_id,
-            new_message=new_message,
-        ):
-            if event.is_final_response() and event.content:
-                for part in event.content.parts or []:
-                    if part.text:
-                        final_text += part.text
+        tools_called: list[dict] = []
+        tool_starts: dict[str, float] = {}   # tool_name → perf_counter start
 
-        memory_store.add_message(session_id, "assistant", final_text)
+        try:
+            async for event in self._runner.run_async(
+                user_id=_USER_ID,
+                session_id=session_id,
+                new_message=new_message,
+            ):
+                # ── tool being called by the model ────────────────────────────
+                for fn_call in event.get_function_calls():
+                    tool_name = fn_call.name
+                    tool_starts[tool_name] = time.perf_counter()
+                    elapsed = ms()
+                    log.info("[tool_start] %-35s elapsed=%dms  args=%r",
+                             tool_name, elapsed, fn_call.args)
+                    yield {
+                        "type":       "tool_start",
+                        "tool":       tool_name,
+                        "args":       fn_call.args or {},
+                        "elapsed_ms": elapsed,
+                    }
 
-        # Trigger background summarization every N turns
-        count = memory_store.message_count(session_id)
-        if count > 0 and count % settings.summarize_after_turns == 0:
-            asyncio.create_task(self._summarize_session(session_id))
+                # ── tool result returned ──────────────────────────────────────
+                for fn_resp in event.get_function_responses():
+                    tool_name  = fn_resp.name
+                    tool_ms    = int((time.perf_counter() - tool_starts.pop(tool_name, t0)) * 1000)
+                    elapsed    = ms()
+                    preview    = str(fn_resp.response or "")[:200]
+                    log.info("[tool_done]  %-35s tool_ms=%dms  elapsed=%dms  preview=%r",
+                             tool_name, tool_ms, elapsed, preview)
+                    entry = {"tool": tool_name, "tool_ms": tool_ms}
+                    tools_called.append(entry)
+                    yield {"type": "tool_done", "elapsed_ms": elapsed, **entry}
 
-        return {"answer": final_text, "session_id": session_id}
+                # ── final answer ──────────────────────────────────────────────
+                if event.is_final_response() and event.content:
+                    for part in event.content.parts or []:
+                        if part.text:
+                            final_text += part.text
+
+            total_ms = ms()
+            log.info("[query_done] session=%s  total_ms=%dms  tools=%r  answer_len=%d",
+                     session_id, total_ms,
+                     [t["tool"] for t in tools_called], len(final_text))
+
+            memory_store.add_message(session_id, "assistant", final_text)
+
+            count = memory_store.message_count(session_id)
+            if count > 0 and count % settings.summarize_after_turns == 0:
+                asyncio.create_task(self._summarize_session(session_id))
+
+            yield {
+                "type":         "answer",
+                "answer":       final_text,
+                "session_id":   session_id,
+                "total_ms":     total_ms,
+                "tools_called": tools_called,
+            }
+
+        except Exception as exc:
+            total_ms = ms()
+            tb = traceback.format_exc()
+            log.error("[query_error] session=%s  total_ms=%dms\n%s", session_id, total_ms, tb)
+            yield {
+                "type":     "error",
+                "message":  str(exc),
+                "trace":    tb,
+                "total_ms": total_ms,
+            }
+
+    async def chat(self, session_id: str, user_message: str) -> dict:
+        """Blocking wrapper around chat_stream() — returns only the final answer dict."""
+        async for event in self.chat_stream(session_id, user_message):
+            if event["type"] in ("answer", "error"):
+                return event
+        return {"answer": "", "session_id": session_id, "total_ms": 0}
 
     def ingest_file(self, file_path: str | Path) -> dict:
         """

@@ -6,6 +6,7 @@ Run (after starting the FastAPI backend):
     streamlit run app.py
 """
 
+import json
 import uuid
 
 import httpx
@@ -13,8 +14,15 @@ import streamlit as st
 
 API_BASE = "http://localhost:8000/api"
 
+# Human-readable labels for each tool
+TOOL_LABELS = {
+    "retrieve_from_knowledge_base": "Searching knowledge base",
+    "calculate":                    "Computing math expression",
+    "get_current_datetime":         "Fetching current date / time",
+}
 
-# helpers ─
+
+# helpers
 
 def api(method: str, path: str, **kwargs):
     url = f"{API_BASE}{path}"
@@ -45,9 +53,26 @@ def fetch_history(session_id: str) -> list[dict]:
     return data if data else []
 
 
-def send_message(session_id: str, message: str) -> str:
-    data = api("POST", "/chat", json={"session_id": session_id, "message": message})
-    return data["answer"] if data else "Error: no response."
+def stream_chat(session_id: str, message: str):
+    """
+    Generator that yields parsed event dicts from the NDJSON /api/chat stream.
+    Handles connection and HTTP errors by yielding an error event.
+    """
+    url = f"{API_BASE}/chat"
+    try:
+        with httpx.stream(
+            "POST", url,
+            json={"session_id": session_id, "message": message},
+            timeout=120,
+        ) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if line.strip():
+                    yield json.loads(line)
+    except httpx.ConnectError:
+        yield {"type": "error", "message": "Cannot reach the API. Is uvicorn running on port 8000?"}
+    except httpx.HTTPStatusError as e:
+        yield {"type": "error", "message": f"API error {e.response.status_code}: {e.response.text}"}
 
 
 def ingest_file(file_bytes: bytes, filename: str) -> dict | None:
@@ -177,15 +202,70 @@ for msg in st.session_state.chat_history:
 user_input = st.chat_input("Ask something about your documents…")
 
 if user_input:
-    # Optimistically render the user message
     st.session_state.chat_history.append({"role": "user", "content": user_input})
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
 
-    # Get response
     with st.chat_message("assistant", avatar="🤖"):
-        with st.spinner("Retrieving and reasoning…"):
-            answer = send_message(st.session_state.active_session_id, user_input)
+        answer       = ""
+        tools_called = []
+        total_ms     = 0
+
+        # Real-time stage display
+        with st.status("Processing query...", expanded=True) as status:
+            for event in stream_chat(st.session_state.active_session_id, user_input):
+                etype = event.get("type")
+
+                if etype == "stage":
+                    status.update(label=event["message"])
+
+                elif etype == "tool_start":
+                    tool  = event["tool"]
+                    label = TOOL_LABELS.get(tool, f"Calling {tool}")
+                    elapsed = event.get("elapsed_ms", 0)
+                    status.update(label=f"{label}...")
+                    st.markdown(f"**{label}** *(+{elapsed} ms)*")
+                    args = event.get("args", {})
+                    if args:
+                        st.json(args, expanded=False)
+
+                elif etype == "tool_done":
+                    tool     = event["tool"]
+                    tool_ms  = event.get("tool_ms", 0)
+                    label    = TOOL_LABELS.get(tool, tool)
+                    st.caption(f"{label} finished in {tool_ms} ms")
+                    tools_called.append(event)
+
+                elif etype == "answer":
+                    answer       = event.get("answer", "")
+                    total_ms     = event.get("total_ms", 0)
+                    tools_called = event.get("tools_called", tools_called)
+                    status.update(
+                        label=f"Done in {total_ms} ms",
+                        state="complete",
+                        expanded=False,
+                    )
+
+                elif etype == "error":
+                    status.update(label="Error", state="error")
+                    st.error(event.get("message", "Unknown error"))
+                    with st.expander("Traceback"):
+                        st.code(event.get("trace", ""), language="python")
+                    answer = f"[Error] {event.get('message', 'Unknown error')}"
+
+        # Answer text (always visible, below the collapsed status)
         st.markdown(answer)
+
+        # Per-tool timing chips
+        if tools_called:
+            cols = st.columns(len(tools_called))
+            for col, t in zip(cols, tools_called):
+                col.metric(
+                    TOOL_LABELS.get(t["tool"], t["tool"]),
+                    f"{t['tool_ms']} ms",
+                )
+
+        if total_ms:
+            st.caption(f"Total query time: {total_ms} ms")
 
     st.session_state.chat_history.append({"role": "assistant", "content": answer})
